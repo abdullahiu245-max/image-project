@@ -122,42 +122,44 @@ function runEzwBinary(inputPath, compressedPath, outputPath, passes) {
       ["--api", inputPath, compressedPath, outputPath, String(passes)],
       { timeout: EXEC_TIMEOUT_MS, maxBuffer: 1024 * 1024 },
       (error, stdout, stderr) => {
-        // If the process never ran at all (binary missing, not
-        // executable, wrong path, etc.) `error` is set and
-        // stdout/stderr will typically both be empty — that's a
-        // completely different problem from "the binary ran but
-        // printed something we couldn't parse", so report it
-        // distinctly and loudly.
-        if (error && !stdout) {
-          console.error("ezw binary failed to run:", {
-            code: error.code,
-            message: error.message,
-            path: EZW_BINARY,
-          });
-
-          return reject(
-            new Error(
-              `The compression binary could not be run (${error.code || "unknown error"}: ${error.message}). ` +
-                `Checked path: ${EZW_BINARY}`
-            )
-          );
+        // Our --api mode always prints one line of JSON to stdout,
+        // on both the success and failure path, so try to parse it
+        // FIRST regardless of whether `error` is set (a non-zero
+        // exit code alone still counts as `error` here, but the
+        // JSON telling us *why* is still sitting in stdout).
+        if (stdout && stdout.trim().startsWith("{")) {
+          try {
+            const parsed = JSON.parse(stdout.trim());
+            return resolve(parsed);
+          } catch (parseErr) {
+            // fall through to the diagnostic branch below
+          }
         }
 
-        // The binary prints exactly one line of JSON to stdout in
-        // --api mode, even on failure, so parse it regardless of
-        // the exit code.
-        let parsed;
-        try {
-          parsed = JSON.parse(stdout.trim());
-        } catch (parseErr) {
-          console.error("Could not parse ezw binary output.", { stdout, stderr, error });
-          return reject(
-            new Error(
-              `Could not parse ezw binary output. stdout="${stdout}" stderr="${stderr}"`
-            )
-          );
-        }
-        resolve(parsed);
+        // If we get here, the binary either never ran, or crashed
+        // before/without printing valid JSON (e.g. a C++-level
+        // crash such as a segfault, missing shared library, or an
+        // unhandled exception). Surface everything we know —
+        // stderr in particular is where a crash reason or dynamic
+        // linker error would show up.
+        const details = {
+          binaryPath: EZW_BINARY,
+          exitCode: error ? error.code : null,
+          signal: error ? error.signal : null,
+          nodeErrorMessage: error ? error.message : null,
+          stdout: stdout || "(empty)",
+          stderr: stderr || "(empty)",
+        };
+
+        console.error("ezw binary did not produce usable output:", details);
+
+        return reject(
+          new Error(
+            `Compression binary failed. ` +
+              `signal=${details.signal} exitCode=${details.exitCode} ` +
+              `stderr="${details.stderr}" stdout="${details.stdout}"`
+          )
+        );
       }
     );
   });
