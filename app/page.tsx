@@ -5,6 +5,8 @@ import { useState, useRef } from "react";
 const API_URL = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8080";
 
 interface CompressionStats {
+  uploadWidth: number;
+  uploadHeight: number;
   originalWidth: number;
   originalHeight: number;
   paddedWidth: number;
@@ -185,6 +187,16 @@ export default function Home() {
       {result?.stats && (
         <section className="bg-slate-900/60 border border-slate-800 rounded-xl p-6">
           <h2 className="text-sm text-slate-400 mb-4">Results</h2>
+
+          {(result.stats.uploadWidth !== result.stats.originalWidth ||
+            result.stats.uploadHeight !== result.stats.originalHeight) && (
+            <p className="text-xs text-amber-400/90 bg-amber-950/30 border border-amber-900/50 rounded-lg px-3 py-2 mb-4">
+              Downscaled from {result.stats.uploadWidth} × {result.stats.uploadHeight} to{" "}
+              {result.stats.originalWidth} × {result.stats.originalHeight} before compression, to keep
+              memory use bounded on the server.
+            </p>
+          )}
+
           <div className="grid grid-cols-2 sm:grid-cols-3 gap-x-6 gap-y-4 text-sm">
             <Stat label="Dimensions" value={`${result.stats.originalWidth} × ${result.stats.originalHeight}`} />
             <Stat label="Wavelet levels" value={String(result.stats.wavelettLevels)} />
