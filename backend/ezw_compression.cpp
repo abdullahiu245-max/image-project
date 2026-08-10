@@ -237,6 +237,16 @@ bool writePGM(const string& filename, const Image& image)
 =============================================================
 */
 
+// A real photo padded up to the next power of two can reach
+// several thousand pixels per side — enough to need 500MB-1GB+
+// once converted into this program's double-precision buffers,
+// which is enough to get the process killed outright (SIGKILL)
+// on a memory-constrained server. Capping the longest side
+// before that conversion happens (and, for OpenCV input,
+// BEFORE decoding to full resolution at all where possible)
+// keeps memory use predictable regardless of upload size.
+const int MAX_DIMENSION = 800;
+
 bool readImage(const string& filename, Image& image)
 {
     string ext = getExtension(filename);
@@ -254,6 +264,24 @@ bool readImage(const string& filename, Image& image)
         cerr << "Error: Cannot open input image: "
              << filename << endl;
         return false;
+    }
+
+    // Downscale here, on the compact 1-byte-per-pixel Mat,
+    // rather than after converting to our 8-byte-per-pixel
+    // double buffer below — for a large photo this avoids ever
+    // allocating the double buffer at full resolution at all.
+    int longestSide = max(loaded.cols, loaded.rows);
+
+    if (longestSide > MAX_DIMENSION)
+    {
+        double scale = static_cast<double>(MAX_DIMENSION) / longestSide;
+
+        int newWidth = max(1, static_cast<int>(round(loaded.cols * scale)));
+        int newHeight = max(1, static_cast<int>(round(loaded.rows * scale)));
+
+        cv::Mat resized;
+        cv::resize(loaded, resized, cv::Size(newWidth, newHeight), 0, 0, cv::INTER_AREA);
+        loaded = resized;
     }
 
     image.width = loaded.cols;
@@ -406,6 +434,75 @@ Image cropImage(const Image& src, int origWidth, int origHeight)
     }
 
     return cropped;
+}
+
+/*
+=============================================================
+       DOWNSCALE OVERSIZED UPLOADS
+
+       A real photo (e.g. 4000x3000 from a phone) padded up
+       to the next power of two can reach 4096x4096 — about
+       16.8 million pixels. At that size the wavelet tree,
+       coefficient arrays, and working buffers this program
+       allocates need 500MB-1GB+ of RAM, which is enough to
+       get the process killed outright (SIGKILL) on a memory-
+       constrained server. Capping the longest side before
+       any of that allocation happens keeps memory use
+       predictable regardless of what gets uploaded, and a
+       demo of the compression algorithm doesn't need full
+       photo resolution to make its point.
+=============================================================
+*/
+
+Image resizeToMaxDimension(const Image& src, int maxDimension)
+{
+    int longestSide = max(src.width, src.height);
+
+    if (longestSide <= maxDimension)
+        return src;
+
+    double scale = static_cast<double>(maxDimension) / longestSide;
+
+    int newWidth = max(1, static_cast<int>(round(src.width * scale)));
+    int newHeight = max(1, static_cast<int>(round(src.height * scale)));
+
+    Image dst;
+    dst.width = newWidth;
+    dst.height = newHeight;
+    dst.maxValue = src.maxValue;
+    dst.pixels.resize(newWidth * newHeight);
+
+    // Simple bilinear resampling — good enough for a downscale
+    // step, and doesn't depend on OpenCV being available.
+    for (int y = 0; y < newHeight; y++)
+    {
+        double srcYf = (y + 0.5) * src.height / static_cast<double>(newHeight) - 0.5;
+        int y0 = static_cast<int>(floor(srcYf));
+        double fy = srcYf - y0;
+        int y1 = min(y0 + 1, src.height - 1);
+        y0 = max(y0, 0);
+
+        for (int x = 0; x < newWidth; x++)
+        {
+            double srcXf = (x + 0.5) * src.width / static_cast<double>(newWidth) - 0.5;
+            int x0 = static_cast<int>(floor(srcXf));
+            double fx = srcXf - x0;
+            int x1 = min(x0 + 1, src.width - 1);
+            x0 = max(x0, 0);
+
+            double top =
+                src.pixels[y0 * src.width + x0] * (1 - fx) +
+                src.pixels[y0 * src.width + x1] * fx;
+
+            double bottom =
+                src.pixels[y1 * src.width + x0] * (1 - fx) +
+                src.pixels[y1 * src.width + x1] * fx;
+
+            dst.pixels[y * newWidth + x] = top * (1 - fy) + bottom * fy;
+        }
+    }
+
+    return dst;
 }
 
 /*
@@ -1295,8 +1392,330 @@ long long getFileSize(const string& filename)
 =============================================================
 */
 
-int main()
+/*
+=============================================================
+                  PIPELINE RESULT / RUNNER
+
+    Runs the whole compress -> decompress -> measure
+    pipeline and returns the stats as a struct, instead of
+    printing directly. This is what both the interactive
+    console mode AND the non-interactive CLI mode (used when
+    this binary is invoked as a backend subprocess, e.g.
+    `./ezw --api input.jpg out.ezw out.png`) call into.
+=============================================================
+*/
+
+struct CompressionResult
 {
+    bool success = false;
+    string errorMessage;
+
+    int uploadWidth = 0;
+    int uploadHeight = 0;
+    int origWidth = 0;
+    int origHeight = 0;
+    int paddedWidth = 0;
+    int paddedHeight = 0;
+    int levels = 0;
+    int passes = 0;
+
+    long long originalFileSize = 0;
+    long long compressedFileSize = 0;
+    double compressionRatio = 0;
+    double spaceSavingPercent = 0;
+
+    double mse = 0;
+    double psnr = 0;
+};
+
+string jsonEscape(const string& s)
+{
+    string out;
+
+    for (char c : s)
+    {
+        if (c == '"' || c == '\\')
+            out += '\\';
+
+        out += c;
+    }
+
+    return out;
+}
+
+string toJSON(const CompressionResult& r)
+{
+    ostringstream out;
+
+    out << fixed << setprecision(6);
+    out << "{";
+    out << "\"success\":" << (r.success ? "true" : "false");
+
+    if (!r.success)
+    {
+        out << ",\"error\":\"" << jsonEscape(r.errorMessage) << "\"";
+        out << "}";
+        return out.str();
+    }
+
+    out << ",\"uploadWidth\":" << r.uploadWidth;
+    out << ",\"uploadHeight\":" << r.uploadHeight;
+    out << ",\"origWidth\":" << r.origWidth;
+    out << ",\"origHeight\":" << r.origHeight;
+    out << ",\"paddedWidth\":" << r.paddedWidth;
+    out << ",\"paddedHeight\":" << r.paddedHeight;
+    out << ",\"levels\":" << r.levels;
+    out << ",\"passes\":" << r.passes;
+    out << ",\"originalFileSize\":" << r.originalFileSize;
+    out << ",\"compressedFileSize\":" << r.compressedFileSize;
+    out << ",\"compressionRatio\":" << r.compressionRatio;
+    out << ",\"spaceSavingPercent\":" << r.spaceSavingPercent;
+    out << ",\"mse\":" << r.mse;
+    out << ",\"psnr\":" << (isinf(r.psnr) ? 999.0 : r.psnr);
+    out << "}";
+
+    return out.str();
+}
+
+CompressionResult runPipeline(const string& inputFile,
+                              const string& compressedFile,
+                              const string& outputFile,
+                              int passes,
+                              bool verbose)
+{
+    CompressionResult result;
+    result.passes = passes;
+
+    Image uploaded;
+
+    if (!readImage(inputFile, uploaded))
+    {
+        result.success = false;
+        result.errorMessage = "Could not read input image: " + inputFile;
+        return result;
+    }
+
+    result.uploadWidth = uploaded.width;
+    result.uploadHeight = uploaded.height;
+
+    if (verbose)
+    {
+        cout << "\nImage loaded successfully.\n";
+        cout << "Width  : " << uploaded.width << endl;
+        cout << "Height : " << uploaded.height << endl;
+    }
+
+    // Downscale oversized uploads BEFORE any wavelet/EZW
+    // allocation happens — see resizeToMaxDimension()'s comment
+    // for why this matters (avoids getting OOM-killed on large
+    // photos). `original` from here on is the size actually
+    // compressed and reconstructed.
+    Image original = resizeToMaxDimension(uploaded, MAX_DIMENSION);
+
+    if (verbose && (original.width != uploaded.width || original.height != uploaded.height))
+    {
+        cout << "Downscaled to: " << original.width << " x " << original.height
+             << " (cap of " << MAX_DIMENSION << "px on the longest side, to keep memory use bounded)\n";
+    }
+
+    result.origWidth = original.width;
+    result.origHeight = original.height;
+
+    int paddedWidth = max(nextPowerOfTwo(original.width), 8);
+    int paddedHeight = max(nextPowerOfTwo(original.height), 8);
+
+    Image padded = padImage(original, paddedWidth, paddedHeight);
+
+    result.paddedWidth = paddedWidth;
+    result.paddedHeight = paddedHeight;
+
+    if (verbose && (paddedWidth != original.width || paddedHeight != original.height))
+    {
+        cout << "Padded to  : " << paddedWidth << " x " << paddedHeight
+             << " (power-of-two requirement of the wavelet transform)\n";
+    }
+
+    int levels = calculateLevels(paddedWidth, paddedHeight);
+    levels = min(levels, 8);
+    levels = max(levels, 1);
+    result.levels = levels;
+
+    if (verbose)
+        cout << "Wavelet Levels: " << levels << endl;
+
+    vector<double> coefficients = padded.pixels;
+
+    if (verbose)
+        cout << "\nPerforming Haar Wavelet Transform...\n";
+
+    haarForward(coefficients, paddedWidth, paddedHeight, levels);
+
+    if (verbose)
+        cout << "Wavelet transform completed.\n\nPerforming EZW Encoding (with zerotree pruning)...\n";
+
+    BitWriter writer;
+    EZWEncoder encoder(coefficients, paddedWidth, paddedHeight, levels);
+    double initialThreshold = encoder.findInitialThreshold();
+
+    encoder.encode(writer, passes);
+
+    const vector<unsigned char>& compressedData = writer.getBytes();
+
+    EZWHeader header;
+    header.paddedWidth = paddedWidth;
+    header.paddedHeight = paddedHeight;
+    header.origWidth = original.width;
+    header.origHeight = original.height;
+    header.levels = levels;
+    header.passes = passes;
+    header.threshold = initialThreshold;
+    header.bitCount = writer.getBitCount();
+
+    if (!saveEZW(compressedFile, header, compressedData))
+    {
+        result.success = false;
+        result.errorMessage = "Failed to save compressed file: " + compressedFile;
+        return result;
+    }
+
+    if (verbose)
+        cout << "EZW encoding completed.\n";
+
+    result.originalFileSize = getFileSize(inputFile);
+    result.compressedFileSize = getFileSize(compressedFile);
+
+    if (result.compressedFileSize > 0)
+    {
+        result.compressionRatio =
+            static_cast<double>(result.originalFileSize) / result.compressedFileSize;
+
+        result.spaceSavingPercent =
+            (1.0 - static_cast<double>(result.compressedFileSize) / result.originalFileSize) * 100.0;
+    }
+
+    if (verbose)
+    {
+        cout << "\n=============================================\n";
+        cout << "             COMPRESSION RESULTS\n";
+        cout << "=============================================\n";
+        cout << "Original file size   : " << result.originalFileSize << " bytes\n";
+        cout << "Compressed file size : " << result.compressedFileSize << " bytes\n";
+        cout << fixed << setprecision(2);
+        cout << "Compression ratio    : " << result.compressionRatio << ":1\n";
+        cout << "Space saving         : " << result.spaceSavingPercent << "%\n";
+        cout << "\nPerforming EZW Decoding...\n";
+    }
+
+    EZWHeader loadedHeader;
+    vector<unsigned char> loadedData;
+
+    if (!loadEZW(compressedFile, loadedHeader, loadedData))
+    {
+        result.success = false;
+        result.errorMessage = "Could not load EZW file: " + compressedFile;
+        return result;
+    }
+
+    BitReader reader(loadedData);
+    EZWDecoder decoder(loadedHeader.paddedWidth, loadedHeader.paddedHeight,
+                       loadedHeader.levels, loadedHeader.threshold);
+
+    vector<double> reconstructedCoefficients = decoder.decode(reader, loadedHeader.passes);
+
+    if (verbose)
+        cout << "Performing Inverse Haar Transform...\n";
+
+    haarInverse(reconstructedCoefficients, loadedHeader.paddedWidth,
+               loadedHeader.paddedHeight, loadedHeader.levels);
+
+    Image reconstructedPadded;
+    reconstructedPadded.width = loadedHeader.paddedWidth;
+    reconstructedPadded.height = loadedHeader.paddedHeight;
+    reconstructedPadded.maxValue = 255;
+    reconstructedPadded.pixels = reconstructedCoefficients;
+
+    Image reconstructed = cropImage(reconstructedPadded, loadedHeader.origWidth, loadedHeader.origHeight);
+
+    if (!writeImage(outputFile, reconstructed))
+    {
+        result.success = false;
+        result.errorMessage = "Could not save reconstructed image: " + outputFile;
+        return result;
+    }
+
+    if (verbose)
+        cout << "Reconstructed image saved successfully.\n";
+
+    result.mse = calculateMSE(original, reconstructed);
+    result.psnr = calculatePSNR(result.mse);
+
+    if (verbose)
+    {
+        cout << "\n=============================================\n";
+        cout << "              FINAL RESULTS\n";
+        cout << "=============================================\n";
+        cout << fixed << setprecision(4);
+        cout << "MSE  : " << result.mse << endl;
+        cout << "PSNR : " << result.psnr << " dB\n";
+        cout << "\nInput image        : " << inputFile << endl;
+        cout << "Compressed file    : " << compressedFile << endl;
+        cout << "Reconstructed image: " << outputFile << endl;
+        cout << "\n=============================================\n";
+        cout << "          COMPRESSION COMPLETED\n";
+        cout << "=============================================\n";
+    }
+
+    result.success = true;
+    return result;
+}
+
+/*
+=============================================================
+                  MAIN PROGRAM
+
+    Two modes:
+
+    1) Interactive (no args, or run with just "--interactive"):
+       prompts on stdin exactly like before, prints the full
+       human-readable report. This is what you use on your
+       own machine.
+
+    2) API / non-interactive mode, for when this binary is
+       invoked as a subprocess by a backend server:
+
+           ./ezw --api <input> <compressed> <output> [passes]
+
+       Prints ONLY a single line of JSON to stdout with the
+       result (or an error), and nothing else. No prompts.
+=============================================================
+*/
+
+int main(int argc, char* argv[])
+{
+    if (argc >= 2 && string(argv[1]) == "--api")
+    {
+        if (argc < 5)
+        {
+            cout << "{\"success\":false,\"error\":"
+                 << "\"usage: ezw --api <input> <compressed> <output> [passes]\"}";
+            return 1;
+        }
+
+        string inputFile = argv[2];
+        string compressedFile = argv[3];
+        string outputFile = argv[4];
+        int passes = (argc >= 6) ? atoi(argv[5]) : 12;
+
+        if (passes < 1) passes = 12;
+
+        CompressionResult result =
+            runPipeline(inputFile, compressedFile, outputFile, passes, false);
+
+        cout << toJSON(result);
+
+        return result.success ? 0 : 1;
+    }
+
     cout << "=============================================\n";
     cout << "       EZW IMAGE COMPRESSION SYSTEM\n";
 #ifdef USE_OPENCV
@@ -1324,331 +1743,13 @@ int main()
     cout << "Enter reconstructed image name: ";
     cin >> outputFile;
 
-    /*
-    ---------------------------------------------------------
-                       READ IMAGE
-    ---------------------------------------------------------
-    */
+    CompressionResult result = runPipeline(inputFile, compressedFile, outputFile, 12, true);
 
-    Image original;
-
-    if (!readImage(inputFile, original))
+    if (!result.success)
     {
+        cerr << "\nError: " << result.errorMessage << endl;
         return 1;
     }
-
-    cout << "\nImage loaded successfully.\n";
-
-    cout << "Width  : "
-         << original.width << endl;
-
-    cout << "Height : "
-         << original.height << endl;
-
-    /*
-    ---------------------------------------------------------
-          PAD TO POWER-OF-TWO DIMENSIONS (if needed)
-
-          Any image size is now accepted. If it isn't
-          already a power of two on both axes, it is padded
-          by replicating edge pixels; the padding is cropped
-          back off before the reconstructed image is saved.
-    ---------------------------------------------------------
-    */
-
-    int paddedWidth = nextPowerOfTwo(original.width);
-    int paddedHeight = nextPowerOfTwo(original.height);
-
-    // Guarantee a minimum size so there's at least one
-    // useful decomposition level.
-    paddedWidth = max(paddedWidth, 8);
-    paddedHeight = max(paddedHeight, 8);
-
-    Image padded = padImage(original, paddedWidth, paddedHeight);
-
-    if (paddedWidth != original.width || paddedHeight != original.height)
-    {
-        cout << "Padded to  : " << paddedWidth << " x "
-             << paddedHeight
-             << " (power-of-two requirement of the wavelet transform)\n";
-    }
-
-    /*
-    ---------------------------------------------------------
-                 CALCULATE WAVELET LEVEL
-    ---------------------------------------------------------
-    */
-
-    int levels = calculateLevels(paddedWidth, paddedHeight);
-
-    // Keep recursion/tree depth sane for very large images.
-    levels = min(levels, 8);
-    levels = max(levels, 1);
-
-    cout << "Wavelet Levels: "
-         << levels << endl;
-
-    /*
-    ---------------------------------------------------------
-                    COPY IMAGE DATA
-    ---------------------------------------------------------
-    */
-
-    vector<double> coefficients = padded.pixels;
-
-    /*
-    ---------------------------------------------------------
-                  FORWARD WAVELET
-    ---------------------------------------------------------
-    */
-
-    cout << "\nPerforming Haar Wavelet Transform..."
-         << endl;
-
-    haarForward(
-        coefficients,
-        paddedWidth,
-        paddedHeight,
-        levels);
-
-    cout << "Wavelet transform completed.\n";
-
-    /*
-    ---------------------------------------------------------
-                       EZW ENCODING
-    ---------------------------------------------------------
-    */
-
-    cout << "\nPerforming EZW Encoding (with zerotree pruning)..."
-         << endl;
-
-    BitWriter writer;
-
-    EZWEncoder encoder(
-        coefficients,
-        paddedWidth,
-        paddedHeight,
-        levels);
-
-    double initialThreshold =
-        encoder.findInitialThreshold();
-
-    int passes = 12;
-
-    encoder.encode(writer, passes);
-
-    const vector<unsigned char>& compressedData =
-        writer.getBytes();
-
-    EZWHeader header;
-
-    header.paddedWidth = paddedWidth;
-    header.paddedHeight = paddedHeight;
-    header.origWidth = original.width;
-    header.origHeight = original.height;
-    header.levels = levels;
-    header.passes = passes;
-    header.threshold = initialThreshold;
-    header.bitCount = writer.getBitCount();
-
-    /*
-    ---------------------------------------------------------
-                    SAVE COMPRESSED DATA
-    ---------------------------------------------------------
-    */
-
-    if (!saveEZW(
-            compressedFile,
-            header,
-            compressedData))
-    {
-        cerr << "Failed to save compressed file."
-             << endl;
-
-        return 1;
-    }
-
-    cout << "EZW encoding completed.\n";
-
-    /*
-    ---------------------------------------------------------
-                      DISPLAY SIZE
-    ---------------------------------------------------------
-    */
-
-    long long originalSize =
-        getFileSize(inputFile);
-
-    long long compressedSize =
-        getFileSize(compressedFile);
-
-    cout << "\n=============================================\n";
-    cout << "             COMPRESSION RESULTS\n";
-    cout << "=============================================\n";
-
-    cout << "Original file size   : "
-         << originalSize
-         << " bytes\n";
-
-    cout << "Compressed file size : "
-         << compressedSize
-         << " bytes\n";
-
-    if (compressedSize > 0)
-    {
-        double ratio =
-            static_cast<double>(originalSize) /
-            compressedSize;
-
-        double percentage =
-            (1.0 -
-             static_cast<double>(compressedSize) /
-             originalSize) * 100.0;
-
-        cout << fixed
-             << setprecision(2);
-
-        cout << "Compression ratio    : "
-             << ratio << ":1\n";
-
-        cout << "Space saving         : "
-             << percentage << "%\n";
-    }
-
-    /*
-    ---------------------------------------------------------
-                     EZW DECODING
-    ---------------------------------------------------------
-    */
-
-    cout << "\nPerforming EZW Decoding..."
-         << endl;
-
-    EZWHeader loadedHeader;
-
-    vector<unsigned char> loadedData;
-
-    if (!loadEZW(
-            compressedFile,
-            loadedHeader,
-            loadedData))
-    {
-        cerr << "Could not load EZW file."
-             << endl;
-
-        return 1;
-    }
-
-    BitReader reader(loadedData);
-
-    EZWDecoder decoder(
-        loadedHeader.paddedWidth,
-        loadedHeader.paddedHeight,
-        loadedHeader.levels,
-        loadedHeader.threshold);
-
-    vector<double> reconstructedCoefficients =
-        decoder.decode(reader, loadedHeader.passes);
-
-    /*
-    ---------------------------------------------------------
-                  INVERSE WAVELET
-    ---------------------------------------------------------
-    */
-
-    cout << "Performing Inverse Haar Transform..."
-         << endl;
-
-    haarInverse(
-        reconstructedCoefficients,
-        loadedHeader.paddedWidth,
-        loadedHeader.paddedHeight,
-        loadedHeader.levels);
-
-    /*
-    ---------------------------------------------------------
-               CREATE RECONSTRUCTED IMAGE
-               (crop the padding back off)
-    ---------------------------------------------------------
-    */
-
-    Image reconstructedPadded;
-
-    reconstructedPadded.width = loadedHeader.paddedWidth;
-    reconstructedPadded.height = loadedHeader.paddedHeight;
-    reconstructedPadded.maxValue = 255;
-    reconstructedPadded.pixels = reconstructedCoefficients;
-
-    Image reconstructed = cropImage(
-        reconstructedPadded,
-        loadedHeader.origWidth,
-        loadedHeader.origHeight);
-
-    /*
-    ---------------------------------------------------------
-                    SAVE IMAGE
-    ---------------------------------------------------------
-    */
-
-    if (!writeImage(
-            outputFile,
-            reconstructed))
-    {
-        cerr << "Could not save reconstructed image."
-             << endl;
-
-        return 1;
-    }
-
-    cout << "Reconstructed image saved successfully.\n";
-
-    /*
-    ---------------------------------------------------------
-                  CALCULATE MSE / PSNR
-                  (compared against the ORIGINAL,
-                  un-padded image)
-    ---------------------------------------------------------
-    */
-
-    double mse =
-        calculateMSE(
-            original,
-            reconstructed);
-
-    double psnr =
-        calculatePSNR(mse);
-
-    /*
-    ---------------------------------------------------------
-                     FINAL RESULTS
-    ---------------------------------------------------------
-    */
-
-    cout << "\n=============================================\n";
-    cout << "              FINAL RESULTS\n";
-    cout << "=============================================\n";
-
-    cout << fixed
-         << setprecision(4);
-
-    cout << "MSE  : "
-         << mse << endl;
-
-    cout << "PSNR : "
-         << psnr << " dB\n";
-
-    cout << "\nInput image        : "
-         << inputFile << endl;
-
-    cout << "Compressed file    : "
-         << compressedFile << endl;
-
-    cout << "Reconstructed image: "
-         << outputFile << endl;
-
-    cout << "\n=============================================\n";
-    cout << "          COMPRESSION COMPLETED\n";
-    cout << "=============================================\n";
 
     return 0;
 }
