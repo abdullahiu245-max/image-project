@@ -1,0 +1,19 @@
+{
+  "name": "ezw-backend",
+  "version": "1.0.0",
+  "description": "HTTP API wrapping the C++ EZW image compression binary",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "build:cpp": "g++ -O2 -std=c++17 -DUSE_OPENCV ezw_compression.cpp -o ezw `pkg-config --cflags --libs opencv4`",
+    "build:cpp:no-opencv": "g++ -O2 -std=c++17 ezw_compression.cpp -o ezw"
+  },
+  "dependencies": {
+    "cors": "^2.8.5",
+    "express": "^4.19.2",
+    "multer": "^1.4.5-lts.1"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}

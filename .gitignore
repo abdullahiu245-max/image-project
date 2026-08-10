@@ -1,0 +1,11 @@
+node_modules
+.next
+out
+.env.local
+.vercel
+*.log
+backend/ezw
+backend/*.ezw
+backend/*.pgm
+backend/*.png
+!backend/README.md
